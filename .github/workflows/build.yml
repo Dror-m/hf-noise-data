@@ -15,6 +15,10 @@ on:
         description: "Geofabrik region path or id to remove"
         required: false
         default: ""
+      refresh_region:
+        description: "Geofabrik region path or id to rebuild alone (others are copied from the live site)"
+        required: false
+        default: ""
   schedule:
     - cron: "17 2 3 * *"   # monthly, 3rd day 02:17 UTC
   push:
@@ -63,8 +67,21 @@ jobs:
           python-version: "3.12"
       - name: Install pyosmium
         run: pip install osmium
-      - name: Build all regions
-        run: python scripts/build_all.py site
+      - name: Build regions (only the changed one; others copied from the live site)
+        env:
+          EV: ${{ github.event_name }}
+          ADD: ${{ inputs.add_region }}
+          REMOVE: ${{ inputs.remove_region }}
+          REFRESH: ${{ inputs.refresh_region }}
+        run: |
+          ARGS=""
+          if [ "$EV" = "workflow_dispatch" ]; then
+            if [ -n "$ADD" ]; then ARGS="--only ${ADD##*/}"
+            elif [ -n "$REFRESH" ]; then ARGS="--only ${REFRESH##*/}"
+            elif [ -n "$REMOVE" ]; then ARGS="--only none"; fi
+          fi
+          echo "build_all.py site $ARGS"
+          python scripts/build_all.py site $ARGS
       - name: Add landing page
         run: |
           echo '<!doctype html><meta charset="utf-8"><title>hf-noise-data</title><p>HF noise source tiles. See <a href="regions.json">regions.json</a>. Data © OpenStreetMap contributors, ODbL.</p>' > site/index.html
