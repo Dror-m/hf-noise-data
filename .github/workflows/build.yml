@@ -1,0 +1,56 @@
+name: Build HF noise source tiles
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 3 * *"   # monthly, 3rd day 02:17 UTC
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pyosmium
+        run: pip install osmium
+      - name: Download OpenStreetMap extract (Geofabrik)
+        run: |
+          curl -fL --retry 5 --retry-delay 10 -o region.osm.pbf https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf
+          curl -fL --retry 5 --retry-delay 10 -o region.poly https://download.geofabrik.de/asia/israel-and-palestine.poly
+          ls -la region.*
+      - name: Build tiles
+        run: python scripts/build_tiles.py region.osm.pbf region.poly site
+      - name: Add landing page
+        run: |
+          cp README.md site/README.md
+          echo '<!doctype html><meta charset="utf-8"><title>hf-noise-data</title><p>HF noise source tiles. See <a href="index.json">index.json</a>. Data © OpenStreetMap contributors, ODbL.</p>' > site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
