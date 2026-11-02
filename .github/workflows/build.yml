@@ -2,45 +2,73 @@ name: Build HF noise source tiles
 
 on:
   workflow_dispatch:
+    inputs:
+      add_region:
+        description: "Geofabrik region path to add, e.g. europe/greece (empty = just rebuild)"
+        required: false
+        default: ""
+      region_name:
+        description: "Display name for the added region"
+        required: false
+        default: ""
+      remove_region:
+        description: "Geofabrik region path or id to remove"
+        required: false
+        default: ""
   schedule:
     - cron: "17 2 3 * *"   # monthly, 3rd day 02:17 UTC
   push:
     branches: [main]
     paths:
       - "scripts/**"
+      - "regions.json"
       - ".github/workflows/build.yml"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Use the latest regions list
+        run: git fetch origin main && git reset --hard origin/main
+      - name: Update regions list
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.add_region != '' || inputs.remove_region != '') }}
+        env:
+          ADD: ${{ inputs.add_region }}
+          NAME: ${{ inputs.region_name }}
+          REMOVE: ${{ inputs.remove_region }}
+        run: |
+          if [ -n "$ADD" ]; then python scripts/edit_regions.py add "$ADD" "$NAME"; fi
+          if [ -n "$REMOVE" ]; then python scripts/edit_regions.py remove "$REMOVE"; fi
+          if ! git diff --quiet regions.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Update regions: add=${ADD} remove=${REMOVE}" regions.json
+            git push origin HEAD:main
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install pyosmium
         run: pip install osmium
-      - name: Download OpenStreetMap extract (Geofabrik)
-        run: |
-          curl -fL --retry 5 --retry-delay 10 -o region.osm.pbf https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf
-          curl -fL --retry 5 --retry-delay 10 -o region.poly https://download.geofabrik.de/asia/israel-and-palestine.poly
-          ls -la region.*
-      - name: Build tiles
-        run: python scripts/build_tiles.py region.osm.pbf region.poly site
+      - name: Build all regions
+        run: python scripts/build_all.py site
       - name: Add landing page
         run: |
-          cp README.md site/README.md
-          echo '<!doctype html><meta charset="utf-8"><title>hf-noise-data</title><p>HF noise source tiles. See <a href="index.json">index.json</a>. Data © OpenStreetMap contributors, ODbL.</p>' > site/index.html
+          echo '<!doctype html><meta charset="utf-8"><title>hf-noise-data</title><p>HF noise source tiles. See <a href="regions.json">regions.json</a>. Data © OpenStreetMap contributors, ODbL.</p>' > site/index.html
+          du -sh site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

@@ -7,6 +7,7 @@ Output (served by GitHub Pages):
   OUT_DIR/index.json             metadata, tile coverage and the list of non-empty tiles
   OUT_DIR/tiles/<lat>_<lon>.json noise-source elements in a 0.2 deg tile (compact format)
   OUT_DIR/borders/<lat>_<lon>.json  national border lines in a 1 deg tile
+  OUT_DIR/islands/<lat>_<lon>.json  island outlines (place=island/islet) in a 1 deg tile
 
 Compact element format (expanded to Overpass-style JSON by the app):
   node:     {"t":"n","id":ID,"c":[lat,lon],"tags":{...}}
@@ -68,6 +69,10 @@ def slim(t):
     return {k: v for k, v in t.items() if k in KEEP_TAGS or k.startswith("communication:")}
 
 
+def is_island(t):
+    return t.get("place") in ("island", "islet")
+
+
 def is_border(t):
     return t.get("boundary") == "administrative" and t.get("admin_level") == "2"
 
@@ -80,12 +85,18 @@ class RelationPass(osmium.SimpleHandler):
         self.rels = {}           # id -> {"tags":..., "members":[(way_id, role)]}
         self.member_ways = set()
         self.border_ways = set()
+        self.island_rels = {}    # id -> {"name":..., "ways":[outer way ids]}
+        self.island_ways = set()
 
     def relation(self, r):
         t = tagdict(r)
         ways = [(m.ref, m.role) for m in r.members if m.type == "w"]
         if is_border(t):
             self.border_ways.update(w for w, _ in ways)
+        if is_island(t):
+            outer = [w for w, role in ways if role != "inner"]
+            self.island_rels[r.id] = {"name": t.get("name:he") or t.get("name:en") or t.get("name") or "", "ways": outer}
+            self.island_ways.update(outer)
         if t.get("type") in ("multipolygon",) and want(t):
             self.rels[r.id] = {"tags": slim(t), "members": ways}
             self.member_ways.update(w for w, _ in ways)
@@ -94,13 +105,16 @@ class RelationPass(osmium.SimpleHandler):
 class GeometryPass(osmium.SimpleHandler):
     """Pass 2 (with node locations): nodes, ways, member-way and border-way geometry."""
 
-    def __init__(self, member_ways, border_ways):
+    def __init__(self, member_ways, border_ways, island_ways):
         super().__init__()
         self.member_ways = member_ways
         self.border_ways = border_ways
+        self.island_ways = island_ways
         self.elements = []
         self.member_geom = {}
         self.borders = []
+        self.island_geom = {}
+        self.island_closed = []   # [id, name, ring] from closed ways tagged place=island/islet
 
     def node(self, n):
         if not n.tags or not n.location.valid():
@@ -114,7 +128,9 @@ class GeometryPass(osmium.SimpleHandler):
         w_want = want(t)
         in_rel = w.id in self.member_ways
         in_border = w.id in self.border_ways
-        if not (w_want or in_rel or in_border):
+        in_isl = w.id in self.island_ways
+        isl_way = is_island(t)
+        if not (w_want or in_rel or in_border or in_isl or isl_way):
             return
         g = []
         for nr in w.nodes:
@@ -129,6 +145,85 @@ class GeometryPass(osmium.SimpleHandler):
             self.member_geom[w.id] = g
         if in_border and t.get("maritime") != "yes" and t.get("natural") != "coastline" and len(g) >= 2:
             self.borders.append([w.id, g])
+        if in_isl:
+            self.island_geom[w.id] = g
+        if isl_way and len(g) >= 4 and g[0] == g[-1]:
+            self.island_closed.append(["w" + str(w.id), t.get("name:he") or t.get("name:en") or t.get("name") or "", g])
+
+
+def join_ways(lines):
+    """Merge polylines that share end points into chains (closed chains are rings)."""
+    lines = [l for l in lines if len(l) >= 2]
+    key = lambda p: (p[0], p[1])
+    ends = {}
+    for i, l in enumerate(lines):
+        ends.setdefault(key(l[0]), []).append(i)
+        ends.setdefault(key(l[-1]), []).append(i)
+    used = [False] * len(lines)
+    out = []
+    for i in range(len(lines)):
+        if used[i]:
+            continue
+        used[i] = True
+        ch = list(lines[i])
+        grown = True
+        while grown and key(ch[0]) != key(ch[-1]):
+            grown = False
+            for tail in (True, False):
+                p = key(ch[-1] if tail else ch[0])
+                for j in ends.get(p, []):
+                    if used[j]:
+                        continue
+                    l = lines[j]
+                    if tail:
+                        ch += (l[1:] if key(l[0]) == p else l[::-1][1:])
+                    else:
+                        ch = (l[:-1] if key(l[-1]) == p else l[::-1][:-1]) + ch
+                    used[j] = True
+                    grown = True
+                    break
+                if grown:
+                    break
+        out.append(ch)
+    return out
+
+
+def simplify(ring, tol_m):
+    """Douglas-Peucker in metres (local projection)."""
+    if len(ring) <= 4:
+        return ring
+    lat0 = ring[0][0]
+    mx, my = 111320 * math.cos(math.radians(lat0)), 110574
+    q = [((p[1]) * mx, (p[0]) * my) for p in ring]
+    keep = [False] * len(q)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(q) - 1)]
+    while stack:
+        a, b = stack.pop()
+        ax, ay = q[a]
+        bx, by = q[b]
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy or 1e-9
+        md, mi = -1, -1
+        for i in range(a + 1, b):
+            t = max(0, min(1, ((q[i][0] - ax) * dx + (q[i][1] - ay) * dy) / L2))
+            d = math.hypot(q[i][0] - ax - t * dx, q[i][1] - ay - t * dy)
+            if d > md:
+                md, mi = d, i
+        if md > tol_m:
+            keep[mi] = True
+            stack += [(a, mi), (mi, b)]
+    return [p for p, k in zip(ring, keep) if k]
+
+
+def ring_area_km2(r):
+    lat0 = sum(p[0] for p in r) / len(r)
+    mx, my = 111320 * math.cos(math.radians(lat0)), 110574
+    a = 0
+    for i in range(len(r)):
+        j = (i + 1) % len(r)
+        a += r[i][1] * mx * r[j][0] * my - r[j][1] * mx * r[i][0] * my
+    return abs(a) / 2 / 1e6
 
 
 def coords_of(el):
@@ -238,7 +333,7 @@ def main():
     p1.apply_file(pbf)
     print(f"relations: {len(p1.rels)}, member ways: {len(p1.member_ways)}, border ways: {len(p1.border_ways)}", flush=True)
 
-    p2 = GeometryPass(p1.member_ways, p1.border_ways)
+    p2 = GeometryPass(p1.member_ways, p1.border_ways, p1.island_ways)
     p2.apply_file(pbf, locations=True, idx="flex_mem")
     elements = p2.elements
     for rid, r in p1.rels.items():
@@ -263,7 +358,29 @@ def main():
         with open(os.path.join(out, "borders", tkey(i, j, BTILE) + ".json"), "w", encoding="utf-8") as f:
             json.dump({"ways": ws}, f, separators=(",", ":"))
 
+    islands = list(p2.island_closed)
+    for rid, r in p1.island_rels.items():
+        for k, ring in enumerate(join_ways([p2.island_geom[w] for w in r["ways"] if w in p2.island_geom])):
+            if len(ring) >= 4 and ring[0] == ring[-1]:
+                islands.append(["r%d_%d" % (rid, k), r["name"], ring])
+    itiles = {}
+    for iid, name, ring in islands:
+        area = ring_area_km2(ring)
+        r2, tol = ring, 5
+        while len(r2) > 3000:
+            r2 = simplify(ring, tol)
+            tol *= 2
+        rec = {"id": iid, "name": name, "a": round(area, 3), "ring": r2}
+        for ij in tile_keys(ring, BTILE):
+            itiles.setdefault(ij, []).append(rec)
+    os.makedirs(os.path.join(out, "islands"), exist_ok=True)
+    for (i, j), recs in itiles.items():
+        with open(os.path.join(out, "islands", tkey(i, j, BTILE) + ".json"), "w", encoding="utf-8") as f:
+            json.dump({"islands": recs}, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"islands: {len(islands)} in {len(itiles)} tiles", flush=True)
+
     rings = load_poly(poly)
+    allpts = [p for r in rings for p in r]
     index = {
         "format": "hfnoise-tiles",
         "version": 1,
@@ -275,6 +392,8 @@ def main():
         "data": sorted(tkey(i, j, TILE) for (i, j) in tiles),
         "bcov": sorted(coverage(rings, BTILE)),
         "bdata": sorted(tkey(i, j, BTILE) for (i, j) in btiles),
+        "idata": sorted(tkey(i, j, BTILE) for (i, j) in itiles),
+        "bbox": [min(p[1] for p in allpts), min(p[0] for p in allpts), max(p[1] for p in allpts), max(p[0] for p in allpts)],
     }
     with open(os.path.join(out, "index.json"), "w", encoding="utf-8") as f:
         json.dump(index, f, separators=(",", ":"))
