@@ -1,3 +1,12 @@
 [
-  {"id": "israel-and-palestine", "path": "asia/israel-and-palestine", "name": "ישראל והשטחים"}
+  {
+    "id": "israel-and-palestine",
+    "path": "asia/israel-and-palestine",
+    "name": "ישראל והשטחים"
+  },
+  {
+    "id": "greece",
+    "path": "europe/greece",
+    "name": "יוון"
+  }
 ]
