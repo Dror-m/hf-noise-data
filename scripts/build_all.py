@@ -45,10 +45,10 @@ def copy_live(r, live_meta, site):
     """Copy a published region (index + every listed file) from the live site."""
     base = LIVE + live_meta["base"]
     idx = json.loads(get(base + "index.json"))
-    files = ["tiles/%s.json" % k for k in idx["data"]] + ["borders/%s.json" % k for k in idx["bdata"]] + ["islands/%s.json" % k for k in idx.get("idata", [])]
+    files = ["tiles/%s.json" % k for k in idx["data"]] + ["borders/%s.json" % k for k in idx["bdata"]] + ["islands/%s.json" % k for k in idx.get("idata", [])] + ["ground/%s.json" % k for k in idx.get("gdata", [])]
     dest = os.path.join(site, "r", r["id"])
     shutil.rmtree(dest, ignore_errors=True)
-    for sub in ("tiles", "borders", "islands"):
+    for sub in ("tiles", "borders", "islands", "ground"):
         os.makedirs(os.path.join(dest, sub), exist_ok=True)
 
     def fetch(f):

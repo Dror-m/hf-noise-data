@@ -8,6 +8,11 @@ Output (served by GitHub Pages):
   OUT_DIR/tiles/<lat>_<lon>.json noise-source elements in a 0.2 deg tile (compact format)
   OUT_DIR/borders/<lat>_<lon>.json  national border lines in a 1 deg tile
   OUT_DIR/islands/<lat>_<lon>.json  island outlines (place=island/islet) in a 1 deg tile
+  OUT_DIR/ground/<lat>_<lon>.json   ground cover for propagation in a 0.2 deg tile:
+      {"coast":[[[lat,lon],...],...],      coastline ways, land on the left / sea on the right
+       "sea":[[ring,...],...],            salt pans etc. treated as sea water
+       "water":[[ring,...],...],          lakes and reservoirs
+       "wet":[[ring,...],...]}            irrigated / wet land (farmland, orchards, wetlands, ...)
 
 Compact element format (expanded to Overpass-style JSON by the app):
   node:     {"t":"n","id":ID,"c":[lat,lon],"tags":{...}}
@@ -69,6 +74,20 @@ def slim(t):
     return {k: v for k, v in t.items() if k in KEEP_TAGS or k.startswith("communication:")}
 
 
+WET_LANDUSE = {"farmland", "orchard", "vineyard", "meadow", "greenhouse_horticulture", "plant_nursery", "allotments"}
+
+
+def ground_class(t):
+    """Ground class of an area for ground-wave attenuation, or None."""
+    if t.get("landuse") == "salt_pond":
+        return "sea"
+    if t.get("natural") == "water" or t.get("landuse") in ("reservoir", "basin") or t.get("waterway") == "riverbank":
+        return "water"
+    if t.get("landuse") in WET_LANDUSE or t.get("natural") == "wetland" or t.get("leisure") == "golf_course":
+        return "wet"
+    return None
+
+
 def is_island(t):
     return t.get("place") in ("island", "islet")
 
@@ -87,12 +106,18 @@ class RelationPass(osmium.SimpleHandler):
         self.border_ways = set()
         self.island_rels = {}    # id -> {"name":..., "ways":[outer way ids]}
         self.island_ways = set()
+        self.ground_rels = {}    # id -> {"cls":..., "ways":[way ids]}
+        self.ground_ways = set()
 
     def relation(self, r):
         t = tagdict(r)
         ways = [(m.ref, m.role) for m in r.members if m.type == "w"]
         if is_border(t):
             self.border_ways.update(w for w, _ in ways)
+        gc = ground_class(t)
+        if gc and t.get("type") == "multipolygon":
+            self.ground_rels[r.id] = {"cls": gc, "ways": [w for w, _ in ways]}
+            self.ground_ways.update(w for w, _ in ways)
         if is_island(t):
             outer = [w for w, role in ways if role != "inner"]
             self.island_rels[r.id] = {"name": t.get("name:he") or t.get("name:en") or t.get("name") or "", "ways": outer}
@@ -105,8 +130,12 @@ class RelationPass(osmium.SimpleHandler):
 class GeometryPass(osmium.SimpleHandler):
     """Pass 2 (with node locations): nodes, ways, member-way and border-way geometry."""
 
-    def __init__(self, member_ways, border_ways, island_ways):
+    def __init__(self, member_ways, border_ways, island_ways, ground_ways=frozenset()):
         super().__init__()
+        self.ground_ways = ground_ways
+        self.ground_geom = {}
+        self.coast = []           # [ [ [lat,lon],... ] ]
+        self.ground_polys = []    # [cls, [ring]]
         self.member_ways = member_ways
         self.border_ways = border_ways
         self.island_ways = island_ways
@@ -130,7 +159,10 @@ class GeometryPass(osmium.SimpleHandler):
         in_border = w.id in self.border_ways
         in_isl = w.id in self.island_ways
         isl_way = is_island(t)
-        if not (w_want or in_rel or in_border or in_isl or isl_way):
+        in_ground = w.id in self.ground_ways
+        gc = ground_class(t)
+        coast = t.get("natural") == "coastline"
+        if not (w_want or in_rel or in_border or in_isl or isl_way or in_ground or gc or coast):
             return
         g = []
         for nr in w.nodes:
@@ -147,6 +179,12 @@ class GeometryPass(osmium.SimpleHandler):
             self.borders.append([w.id, g])
         if in_isl:
             self.island_geom[w.id] = g
+        if in_ground:
+            self.ground_geom[w.id] = g
+        if coast and len(g) >= 2:
+            self.coast.append(g)
+        if gc and len(g) >= 4 and g[0] == g[-1]:
+            self.ground_polys.append([gc, [g]])
         if isl_way and len(g) >= 4 and g[0] == g[-1]:
             self.island_closed.append(["w" + str(w.id), t.get("name:he") or t.get("name:en") or t.get("name") or "", g])
 
@@ -333,7 +371,7 @@ def main():
     p1.apply_file(pbf)
     print(f"relations: {len(p1.rels)}, member ways: {len(p1.member_ways)}, border ways: {len(p1.border_ways)}", flush=True)
 
-    p2 = GeometryPass(p1.member_ways, p1.border_ways, p1.island_ways)
+    p2 = GeometryPass(p1.member_ways, p1.border_ways, p1.island_ways, p1.ground_ways)
     p2.apply_file(pbf, locations=True, idx="flex_mem")
     elements = p2.elements
     for rid, r in p1.rels.items():
@@ -379,6 +417,30 @@ def main():
             json.dump({"islands": recs}, f, ensure_ascii=False, separators=(",", ":"))
     print(f"islands: {len(islands)} in {len(itiles)} tiles", flush=True)
 
+    # ground cover tiles (simplified to ~10 m; sea is derived in the app from coastline direction)
+    gpolys = list(p2.ground_polys)
+    for rid, r in p1.ground_rels.items():
+        rr = [ring for ring in join_ways([p2.ground_geom[w] for w in r["ways"] if w in p2.ground_geom]) if len(ring) >= 4 and ring[0] == ring[-1]]
+        if rr:
+            gpolys.append([r["cls"], rr])
+    gtiles = {}
+    for cls, rr in gpolys:
+        rr2 = [simplify(ring, 10) for ring in rr]
+        rr2 = [ring for ring in rr2 if len(ring) >= 4]
+        if not rr2:
+            continue
+        for ij in tile_keys([p for ring in rr for p in ring], TILE):
+            gtiles.setdefault(ij, {}).setdefault(cls, []).append(rr2)
+    for line in p2.coast:
+        l2 = simplify(line, 10)
+        for ij in tile_keys(line, TILE):
+            gtiles.setdefault(ij, {}).setdefault("coast", []).append(l2)
+    os.makedirs(os.path.join(out, "ground"), exist_ok=True)
+    for (i, j), d in gtiles.items():
+        with open(os.path.join(out, "ground", tkey(i, j, TILE) + ".json"), "w", encoding="utf-8") as f:
+            json.dump(d, f, separators=(",", ":"))
+    print(f"ground: {len(gpolys)} areas, {len(p2.coast)} coastline ways in {len(gtiles)} tiles", flush=True)
+
     rings = load_poly(poly)
     allpts = [p for r in rings for p in r]
     index = {
@@ -393,6 +455,7 @@ def main():
         "bcov": sorted(coverage(rings, BTILE)),
         "bdata": sorted(tkey(i, j, BTILE) for (i, j) in btiles),
         "idata": sorted(tkey(i, j, BTILE) for (i, j) in itiles),
+        "gdata": sorted(tkey(i, j, TILE) for (i, j) in gtiles),
         "bbox": [min(p[1] for p in allpts), min(p[0] for p in allpts), max(p[1] for p in allpts), max(p[0] for p in allpts)],
     }
     with open(os.path.join(out, "index.json"), "w", encoding="utf-8") as f:
