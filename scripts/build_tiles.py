@@ -51,7 +51,8 @@ def want(t):
         return True
     if t.get("railway") in ("rail", "light_rail", "tram"):
         return True
-    if t.get("highway") in ("motorway", "trunk", "primary"):
+    # secondary roads are noise sources in the app; tertiary roads only guide the estimated distribution lines
+    if t.get("highway") in ("motorway", "trunk", "primary", "secondary", "tertiary"):
         return True
     if t.get("barrier") == "fence" and t.get("fence_type") == "electric":
         return True
