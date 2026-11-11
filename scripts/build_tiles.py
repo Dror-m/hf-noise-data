@@ -31,7 +31,7 @@ TILE = 0.2      # source tiles, must match TILE in the app
 BTILE = 1       # border tiles, must match the app
 EPS = 1e-7
 
-LANDUSE = {"residential", "industrial", "commercial", "retail", "quarry", "greenhouse_horticulture", "farmyard"}
+LANDUSE = {"residential", "industrial", "commercial", "retail", "quarry", "greenhouse_horticulture", "farmyard", "military"}
 MAN_MADE = {"mast", "tower", "communications_tower", "water_works", "pumping_station", "desalination_plant", "wastewater_plant"}
 BUILDINGS = {"data_center", "greenhouse", "cowshed", "farm_auxiliary", "sty", "stable", "chicken_coop"}
 KEEP_TAGS = {
@@ -39,7 +39,7 @@ KEEP_TAGS = {
     "location", "generator:place", "amenity", "railway", "electrified", "tunnel", "highway",
     "man_made", "tower:type", "communication:mobile_phone", "communication:microwave",
     "communication:radio", "communication:television", "communication:am_radio", "telecom",
-    "building", "landuse", "barrier", "fence_type", "name", "name:he", "type",
+    "building", "landuse", "barrier", "fence_type", "name", "name:he", "type", "aeroway",
 }
 
 
@@ -54,6 +54,8 @@ def want(t):
     if t.get("highway") in ("motorway", "trunk", "primary"):
         return True
     if t.get("barrier") == "fence" and t.get("fence_type") == "electric":
+        return True
+    if t.get("aeroway") == "aerodrome":
         return True
     if t.get("amenity") in ("charging_station", "hospital"):
         return True
