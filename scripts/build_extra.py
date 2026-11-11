@@ -31,7 +31,7 @@ import sys
 import zlib
 
 sys.path.insert(0, os.path.dirname(__file__))
-from build_tiles import TILE, tile_keys, tkey, load_poly, in_ring, simplify  # noqa: E402
+from build_tiles import TILE, tile_keys, tkey, load_poly, in_ring, simplify, coords_of  # noqa: E402
 
 DATASETS = {
     "grw_solar": ("https://github.com/microsoft/global-renewables-watch/releases/download/v1.0/solar_all_2024q2_v1.gpkg", "solar_all_2024q2_v1.gpkg"),
@@ -136,8 +136,9 @@ def main():
                 elif el["t"] == "r":
                     osm_solar.extend(g for role, g in el["m"] if role != "inner" and len(g) >= 4)
             elif "wind" in src:
-                c = el["c"] if el["t"] == "n" else el["g"][0]
-                osm_wind.append(c)
+                cs = coords_of(el)
+                if cs:
+                    osm_wind.append(cs[0])
     sbox = [(min(p[0] for p in g), min(p[1] for p in g), max(p[0] for p in g), max(p[1] for p in g), g) for g in osm_solar]
 
     added = {}   # tile key -> [elements]
