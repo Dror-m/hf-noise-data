@@ -31,7 +31,9 @@ TILE = 0.2      # source tiles, must match TILE in the app
 BTILE = 1       # border tiles, must match the app
 EPS = 1e-7
 
-LANDUSE = {"residential", "industrial", "commercial", "retail", "quarry", "greenhouse_horticulture", "farmyard", "military"}
+LANDUSE = {"residential", "industrial", "commercial", "retail", "quarry", "greenhouse_horticulture", "farmyard"}
+# military: only places with buildings and living quarters, not closed military land (often empty ground)
+MILITARY = {"barracks", "base", "office"}
 MAN_MADE = {"mast", "tower", "communications_tower", "water_works", "pumping_station", "desalination_plant", "wastewater_plant"}
 BUILDINGS = {"data_center", "greenhouse", "cowshed", "farm_auxiliary", "sty", "stable", "chicken_coop"}
 KEEP_TAGS = {
@@ -39,7 +41,7 @@ KEEP_TAGS = {
     "location", "generator:place", "amenity", "railway", "electrified", "tunnel", "highway",
     "man_made", "tower:type", "communication:mobile_phone", "communication:microwave",
     "communication:radio", "communication:television", "communication:am_radio", "telecom",
-    "building", "landuse", "barrier", "fence_type", "name", "name:he", "type", "aeroway",
+    "building", "landuse", "barrier", "fence_type", "name", "name:he", "type", "aeroway", "military",
 }
 
 
@@ -48,6 +50,8 @@ def want(t):
     if p in ("line", "minor_line", "substation", "transformer", "plant", "generator"):
         return True
     if t.get("landuse") in LANDUSE:
+        return True
+    if t.get("military") in MILITARY:
         return True
     if t.get("railway") in ("rail", "light_rail", "tram"):
         return True
