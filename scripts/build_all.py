@@ -18,6 +18,7 @@ import urllib.request
 
 GEOFABRIK = "https://download.geofabrik.de/"
 LIVE = os.environ.get("LIVE_SITE", "https://dror-m.github.io/hf-noise-data/")
+EXTRA_CACHE = os.environ.get("EXTRA_CACHE", "extra_cache")
 
 
 def get(url, timeout=60):
@@ -34,6 +35,10 @@ def build(r, site):
     shutil.rmtree(dest, ignore_errors=True)
     try:
         subprocess.run([sys.executable, "scripts/build_tiles.py", "region.osm.pbf", "region.poly", dest], check=True)
+        # non-OSM sources (Global Renewables Watch, Gridfinder); a failure here keeps the OSM tiles
+        r2 = subprocess.run([sys.executable, "scripts/build_extra.py", dest, "region.poly", EXTRA_CACHE])
+        if r2.returncode:
+            print(f"::warning::extra sources for {rid} failed (exit {r2.returncode}); OSM tiles kept", flush=True)
     finally:
         for f in ("region.osm.pbf", "region.poly"):
             if os.path.exists(f):

@@ -65,8 +65,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install pyosmium
-        run: pip install osmium
+      - name: Install pyosmium and GeoPackage readers
+        run: pip install osmium pyogrio geopandas shapely pyproj
       - name: Build regions (only the changed one; others copied from the live site)
         env:
           EV: ${{ github.event_name }}
