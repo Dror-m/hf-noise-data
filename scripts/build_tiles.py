@@ -32,8 +32,10 @@ BTILE = 1       # border tiles, must match the app
 EPS = 1e-7
 
 LANDUSE = {"residential", "industrial", "commercial", "retail", "quarry", "greenhouse_horticulture", "farmyard"}
-# military: only places with buildings and living quarters, not closed military land (often empty ground)
-MILITARY = {"barracks", "base", "office"}
+# military land is never a source by itself (training areas and firing zones are empty ground).
+# Only the buildings inside military land are kept, grouped into clusters ("hfnoise:mil" elements);
+# residential areas and power lines inside a base are ordinary sources anyway.
+MIL_GROUP_M = 150   # buildings closer than this belong to one cluster
 MAN_MADE = {"mast", "tower", "communications_tower", "water_works", "pumping_station", "desalination_plant", "wastewater_plant"}
 BUILDINGS = {"data_center", "greenhouse", "cowshed", "farm_auxiliary", "sty", "stable", "chicken_coop"}
 KEEP_TAGS = {
@@ -50,8 +52,6 @@ def want(t):
     if p in ("line", "minor_line", "substation", "transformer", "plant", "generator"):
         return True
     if t.get("landuse") in LANDUSE:
-        return True
-    if t.get("military") in MILITARY:
         return True
     if t.get("railway") in ("rail", "light_rail", "tram"):
         return True
@@ -95,6 +95,15 @@ def ground_class(t):
     return None
 
 
+MIL_ZONE = {"base", "barracks", "office", "airfield", "naval_base", "training_area", "range"}
+MIL_SKIP_BUILDING = {"bunker", "ruins", "no", "collapsed", "destroyed", "construction", "roof"}
+
+
+def is_milzone(t):
+    """Military land that may contain buildings (bases, barracks, airfields, training areas ...)."""
+    return t.get("landuse") == "military" or t.get("military") in MIL_ZONE
+
+
 def is_island(t):
     return t.get("place") in ("island", "islet")
 
@@ -115,6 +124,8 @@ class RelationPass(osmium.SimpleHandler):
         self.island_ways = set()
         self.ground_rels = {}    # id -> {"cls":..., "ways":[way ids]}
         self.ground_ways = set()
+        self.mil_rels = {}       # id -> {"name":..., "ways":[outer way ids]}
+        self.mil_ways = set()
 
     def relation(self, r):
         t = tagdict(r)
@@ -125,6 +136,10 @@ class RelationPass(osmium.SimpleHandler):
         if gc and t.get("type") == "multipolygon":
             self.ground_rels[r.id] = {"cls": gc, "ways": [w for w, _ in ways]}
             self.ground_ways.update(w for w, _ in ways)
+        if is_milzone(t) and t.get("type") in ("multipolygon", "boundary"):
+            outer = [w for w, role in ways if role != "inner"]
+            self.mil_rels[r.id] = {"name": t.get("name:he") or t.get("name") or "", "ways": outer}
+            self.mil_ways.update(outer)
         if is_island(t):
             outer = [w for w, role in ways if role != "inner"]
             self.island_rels[r.id] = {"name": t.get("name:he") or t.get("name:en") or t.get("name") or "", "ways": outer}
@@ -137,8 +152,11 @@ class RelationPass(osmium.SimpleHandler):
 class GeometryPass(osmium.SimpleHandler):
     """Pass 2 (with node locations): nodes, ways, member-way and border-way geometry."""
 
-    def __init__(self, member_ways, border_ways, island_ways, ground_ways=frozenset()):
+    def __init__(self, member_ways, border_ways, island_ways, ground_ways=frozenset(), mil_ways=frozenset()):
         super().__init__()
+        self.mil_ways = mil_ways
+        self.mil_geom = {}        # member-way geometry of military relations
+        self.mil_closed = []      # [id, name, ring] closed ways that are military land
         self.ground_ways = ground_ways
         self.ground_geom = {}
         self.coast = []           # [ [ [lat,lon],... ] ]
@@ -169,7 +187,9 @@ class GeometryPass(osmium.SimpleHandler):
         in_ground = w.id in self.ground_ways
         gc = ground_class(t)
         coast = t.get("natural") == "coastline"
-        if not (w_want or in_rel or in_border or in_isl or isl_way or in_ground or gc or coast):
+        in_mil = w.id in self.mil_ways
+        mil_way = is_milzone(t)
+        if not (w_want or in_rel or in_border or in_isl or isl_way or in_ground or gc or coast or in_mil or mil_way):
             return
         g = []
         for nr in w.nodes:
@@ -188,12 +208,124 @@ class GeometryPass(osmium.SimpleHandler):
             self.island_geom[w.id] = g
         if in_ground:
             self.ground_geom[w.id] = g
+        if in_mil:
+            self.mil_geom[w.id] = g
+        if mil_way and len(g) >= 4 and g[0] == g[-1]:
+            self.mil_closed.append(["w" + str(w.id), t.get("name:he") or t.get("name") or "", g])
         if coast and len(g) >= 2:
             self.coast.append(g)
         if gc and len(g) >= 4 and g[0] == g[-1]:
             self.ground_polys.append([gc, [g]])
         if isl_way and len(g) >= 4 and g[0] == g[-1]:
             self.island_closed.append(["w" + str(w.id), t.get("name:he") or t.get("name:en") or t.get("name") or "", g])
+
+
+class MilZones:
+    """Grid index over military-land rings, for point-in-polygon tests of building centroids."""
+
+    CELL = 0.02
+
+    def __init__(self, zones):
+        self.zones = zones          # [(zone_id, name, [ring, ...])], ring = [[lat, lon], ...]
+        self.grid = {}
+        for k, (_, _, rings) in enumerate(zones):
+            lats = [p[0] for r in rings for p in r]
+            lons = [p[1] for r in rings for p in r]
+            for i in range(math.floor(min(lats) / self.CELL), math.floor(max(lats) / self.CELL) + 1):
+                for j in range(math.floor(min(lons) / self.CELL), math.floor(max(lons) / self.CELL) + 1):
+                    self.grid.setdefault((i, j), []).append(k)
+
+    @staticmethod
+    def _in(lat, lon, ring):
+        c = False
+        j = len(ring) - 1
+        for i in range(len(ring)):
+            yi, xi = ring[i]
+            yj, xj = ring[j]
+            if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+                c = not c
+            j = i
+        return c
+
+    def find(self, lat, lon):
+        for k in self.grid.get((math.floor(lat / self.CELL), math.floor(lon / self.CELL)), ()):
+            n = sum(1 for r in self.zones[k][2] if self._in(lat, lon, r))
+            if n % 2 == 1:   # inside an odd number of rings: outer rings minus holes
+                return k
+        return None
+
+
+class BuildingPass(osmium.SimpleHandler):
+    """Pass 3 (with node locations): buildings whose centre lies on military land."""
+
+    def __init__(self, zones):
+        super().__init__()
+        self.zones = zones
+        self.found = []           # [zone index, way id, centroid, ring]
+
+    def way(self, w):
+        b = w.tags.get("building")
+        if not b or b in MIL_SKIP_BUILDING or w.tags.get("military") in ("bunker", "trench"):
+            return
+        g = []
+        for nr in w.nodes:
+            loc = nr.location
+            if loc.valid():
+                g.append([round(loc.lat, 6), round(loc.lon, 6)])
+        if len(g) < 3:
+            return
+        lat = sum(p[0] for p in g) / len(g)
+        lon = sum(p[1] for p in g) / len(g)
+        k = self.zones.find(lat, lon)
+        if k is not None:
+            self.found.append((k, w.id, (lat, lon), g))
+
+
+def mil_clusters(zones, found):
+    """Group the buildings of each military zone into clusters (single linkage within MIL_GROUP_M)."""
+    by_zone = {}
+    for k, wid, c, g in found:
+        by_zone.setdefault(k, []).append((wid, c, g))
+    out = []
+    for k, items in by_zone.items():
+        n = len(items)
+        parent = list(range(n))
+
+        def root(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        lat0 = items[0][1][0]
+        my, mx = 110574.0, 111320.0 * math.cos(math.radians(lat0))
+        cell = MIL_GROUP_M
+        grid = {}
+        for a, (_, (la, lo), _) in enumerate(items):
+            grid.setdefault((math.floor(la * my / cell), math.floor(lo * mx / cell)), []).append(a)
+        for (gi, gj), lst in grid.items():
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    for b in grid.get((gi + di, gj + dj), ()):
+                        for a in lst:
+                            if a < b:
+                                (la1, lo1), (la2, lo2) = items[a][1], items[b][1]
+                                if math.hypot((la1 - la2) * my, (lo1 - lo2) * mx) <= MIL_GROUP_M:
+                                    ra, rb = root(a), root(b)
+                                    if ra != rb:
+                                        parent[ra] = rb
+        groups = {}
+        for a in range(n):
+            groups.setdefault(root(a), []).append(a)
+        name = zones[k][1]
+        for lst in groups.values():
+            first = min(items[a][0] for a in lst)
+            tags = {"hfnoise:mil": "yes", "building:count": str(len(lst))}
+            if name:
+                tags["name"] = name
+            out.append({"t": "r", "id": 8_000_000_000_000 + first, "tags": tags,
+                        "m": [["outer", items[a][2]] for a in lst]})
+    return out
 
 
 def join_ways(lines):
@@ -378,9 +510,22 @@ def main():
     p1.apply_file(pbf)
     print(f"relations: {len(p1.rels)}, member ways: {len(p1.member_ways)}, border ways: {len(p1.border_ways)}", flush=True)
 
-    p2 = GeometryPass(p1.member_ways, p1.border_ways, p1.island_ways, p1.ground_ways)
+    p2 = GeometryPass(p1.member_ways, p1.border_ways, p1.island_ways, p1.ground_ways, p1.mil_ways)
     p2.apply_file(pbf, locations=True, idx="flex_mem")
     elements = p2.elements
+
+    # buildings on military land -> source clusters (the military land itself is not a source)
+    zones = [(zid, name, [ring]) for zid, name, ring in p2.mil_closed]
+    for rid, r in p1.mil_rels.items():
+        rr = [ring for ring in join_ways([p2.mil_geom[w] for w in r["ways"] if w in p2.mil_geom]) if len(ring) >= 4 and ring[0] == ring[-1]]
+        if rr:
+            zones.append(("r%d" % rid, r["name"], rr))
+    if zones:
+        p3 = BuildingPass(MilZones(zones))
+        p3.apply_file(pbf, locations=True, idx="flex_mem")
+        clusters = mil_clusters(zones, p3.found)
+        elements.extend(clusters)
+        print(f"military land: {len(zones)} areas, {len(p3.found)} buildings in {len(clusters)} clusters", flush=True)
     for rid, r in p1.rels.items():
         members = [[role or "outer", p2.member_geom[w]] for w, role in r["members"] if w in p2.member_geom]
         if members:
